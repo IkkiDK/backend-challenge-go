@@ -264,7 +264,7 @@ A REFUND, ROLLBACK or referenced WIN whose reference has not arrived (or is itse
 
 The service does not depend on either: invariants are enforced by the database, duplicates by the inbox and the idempotency key, and order only affects how soon a reversal resolves.
 
-**Handling:** messages are grouped by `MessageGroupId`. Each group is handled sequentially, and up to `CONSUMER_CONCURRENCY` groups run in parallel. For each message:
+**Handling:** messages are grouped by `MessageGroupId`. Each group is handled sequentially, and up to `CONSUMER_CONCURRENCY` groups run in parallel. A message that stays in the queue (to be retried) holds back the rest of its group from that batch: they are released untouched rather than processed ahead of it. For each message:
 
 1. Decode and validate. An invalid message is dead-lettered at once.
 2. Call the same `Submit` use case as HTTP, with the inbox record `(consumer name, messageId, hash, receivedAt)`. The hash is the SHA-256 of type + idempotency key + request fingerprint. The inbox insert and its completion commit **in the same SQL transaction** as the domain changes, ledger and outbox. For `PENDING_REFERENCE`, the inbox completes with the pending record and the worker takes over.

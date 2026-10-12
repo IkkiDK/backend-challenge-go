@@ -155,7 +155,11 @@ func (c *Consumer) handleBatch(messages []types.Message) {
 					c.release(group[i:])
 					return
 				}
-				c.handle(m)
+				if !c.handle(m) {
+					// FIFO: the rest of the group waits until this message is done.
+					c.release(group[i+1:])
+					return
+				}
 			}
 		}()
 	}
@@ -190,7 +194,9 @@ func (c *Consumer) isStopping() bool {
 	}
 }
 
-func (c *Consumer) handle(m types.Message) {
+// handle processes one message and reports whether it left the queue
+// (completed or dead-lettered).
+func (c *Consumer) handle(m types.Message) bool {
 	receivedAt := c.clock()
 	ctx, cancel := context.WithTimeout(c.work, c.cfg.ProcessingTimeout)
 	defer cancel()
@@ -198,8 +204,7 @@ func (c *Consumer) handle(m types.Message) {
 
 	message, err := decodeMessage(aws.ToString(m.Body), m.MessageAttributes)
 	if err != nil {
-		c.deadLetter(ctx, m, "invalid_message", err)
-		return
+		return c.deadLetter(ctx, m, "invalid_message", err)
 	}
 	ctx = observability.WithLogAttrs(ctx,
 		slog.String(observability.KeyMessageID, message.messageID),
@@ -219,15 +224,18 @@ func (c *Consumer) handle(m types.Message) {
 	switch {
 	case err == nil && result.Transaction.Status() == domain.StatusFailed:
 		// Recorded for audit, but surfaced to operators like any permanent error.
-		c.deadLetter(ctx, m, "processing_failed", fmt.Errorf("transaction %s failed permanently", result.Transaction.ID()))
+		return c.deadLetter(ctx, m, "processing_failed", fmt.Errorf("transaction %s failed permanently", result.Transaction.ID()))
 	case err == nil:
 		c.complete(ctx, m, result)
+		return true
 	case c.work.Err() != nil:
 		c.release([]types.Message{m})
+		return false
 	case isPermanent(err):
-		c.deadLetter(ctx, m, deadLetterReason(err), err)
+		return c.deadLetter(ctx, m, deadLetterReason(err), err)
 	default:
 		c.retryLater(ctx, m, err)
+		return false
 	}
 }
 
@@ -288,8 +296,9 @@ func (c *Consumer) retryLater(ctx context.Context, m types.Message, cause error)
 }
 
 // deadLetter copies the message to the dead-letter queue with the reason and
-// deletes it. If the copy fails the message is retried later instead.
-func (c *Consumer) deadLetter(ctx context.Context, m types.Message, reason string, cause error) {
+// deletes it. If the copy fails the message is retried later instead, and
+// deadLetter reports false.
+func (c *Consumer) deadLetter(ctx context.Context, m types.Message, reason string, cause error) bool {
 	detail := cause.Error()
 	if len(detail) > maxDeadLetterErrorLength {
 		detail = detail[:maxDeadLetterErrorLength]
@@ -313,7 +322,7 @@ func (c *Consumer) deadLetter(ctx context.Context, m types.Message, reason strin
 	})
 	if err != nil {
 		c.retryLater(ctx, m, fmt.Errorf("dead-letter %s: %w", reason, err))
-		return
+		return false
 	}
 	c.metrics.SQSMessages.WithLabelValues("dead_lettered").Inc()
 	c.metrics.DeadLettered.WithLabelValues(reason).Inc()
@@ -321,6 +330,7 @@ func (c *Consumer) deadLetter(ctx context.Context, m types.Message, reason strin
 	if err := c.deleteMessage(ctx, m); err != nil {
 		c.logger.WarnContext(ctx, "delete failed after dead-lettering; the redelivery is dead-lettered again", "error", err)
 	}
+	return true
 }
 
 // release makes unhandled messages visible again for another consumer.

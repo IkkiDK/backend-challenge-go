@@ -5,6 +5,7 @@ package integration
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
 	"sync"
@@ -24,6 +25,8 @@ import (
 	"github.com/IkkiDK/backend-challenge-go/internal/app"
 	"github.com/IkkiDK/backend-challenge-go/internal/config"
 	"github.com/IkkiDK/backend-challenge-go/internal/messaging"
+	"github.com/IkkiDK/backend-challenge-go/internal/observability"
+	"github.com/IkkiDK/backend-challenge-go/internal/postgres"
 )
 
 const consumerName = "wallet-service.wager-transactions"
@@ -257,6 +260,32 @@ func TestDatabaseOutageIsRetriedUntilItRecovers(t *testing.T) {
 		return status == "PROCESSED"
 	})
 	requireLedgerMatchesBalance(t, w.ID, 9000)
+}
+
+func TestAFailingMessageHoldsBackTheRestOfItsGroup(t *testing.T) {
+	purge(t, inboundQueue)
+	// A service whose database is unreachable fails every message transiently.
+	metrics := observability.NewMetrics()
+	unreachable := postgres.NewStore(newPool(t, "postgres://nobody:nothing@127.0.0.1:1/wallet?sslmode=disable&connect_timeout=1"), metrics)
+	service, err := app.NewService(unreachable, testPolicy, app.SystemClock, discardLogger(), metrics)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := inProcess{service: service, store: unreachable, metrics: metrics}
+
+	w := walletJSON{ID: uuid.NewString(), PlayerID: uuid.NewString()}
+	for i := range 2 {
+		sendWager(t, w.ID, wagerMessage(fmt.Sprintf("msg-held-%d-%s", i, w.ID), newOperation(w, "BET", fmt.Sprintf("held-%d-%s", i, w.ID), "1.00")))
+	}
+	startConsumer(t, p, sqsClient(t, "wallet-service"), testConsumerConfig(5*time.Second))
+
+	// Each round the first message is retried and the second, delivered in
+	// the same batch, is released untouched instead of overtaking it.
+	eventually(t, 20*time.Second, "two rounds of retries", func() bool { return sqsMessages(p, "retried") >= 2 })
+	retried, released := sqsMessages(p, "retried"), sqsMessages(p, "released")
+	if released < 1 || retried-released > 1 {
+		t.Fatalf("retried %v, released %v: the second message of the group must wait for the first", retried, released)
+	}
 }
 
 func TestMessagesThatKeepFailingReachTheDeadLetterQueueThroughTheRedrivePolicy(t *testing.T) {
