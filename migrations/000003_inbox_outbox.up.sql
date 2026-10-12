@@ -12,8 +12,9 @@ CREATE TABLE outbox_events (
     ordering_key    text        NOT NULL,
     event_type      text        NOT NULL,
     event_version   integer     NOT NULL CHECK (event_version >= 1),
-    -- Immutable snapshot of the published envelope.
-    payload         jsonb       NOT NULL,
+    -- Immutable snapshot of the published envelope. json (not jsonb) keeps
+    -- the exact serialized text, so every publication is byte-identical.
+    payload         json        NOT NULL,
     occurred_at     timestamptz NOT NULL,
     attempts        integer     NOT NULL DEFAULT 0 CHECK (attempts >= 0),
     -- Earliest time a publisher may claim the event: the backoff after a
@@ -39,11 +40,12 @@ BEGIN
         END IF;
         RETURN OLD;
     END IF;
+    -- json has no equality operator; its text is what must not change.
     IF (NEW.id, NEW.sequence, NEW.aggregate_type, NEW.aggregate_id, NEW.ordering_key,
-        NEW.event_type, NEW.event_version, NEW.payload, NEW.occurred_at)
+        NEW.event_type, NEW.event_version, NEW.payload::text, NEW.occurred_at)
         IS DISTINCT FROM
        (OLD.id, OLD.sequence, OLD.aggregate_type, OLD.aggregate_id, OLD.ordering_key,
-        OLD.event_type, OLD.event_version, OLD.payload, OLD.occurred_at) THEN
+        OLD.event_type, OLD.event_version, OLD.payload::text, OLD.occurred_at) THEN
         RAISE EXCEPTION 'outbox event % is an immutable snapshot', OLD.id
             USING ERRCODE = 'WL002';
     END IF;

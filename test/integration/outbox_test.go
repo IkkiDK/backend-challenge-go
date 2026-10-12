@@ -191,6 +191,10 @@ func TestEventPublishedButNotConfirmedIsRepublishedWithTheSameID(t *testing.T) {
 	}
 	// Both publications carried the same id; the FIFO queue drops the second
 	// one within its deduplication window, and any consumer could drop it by id.
+	var snapshot string
+	if err := env.owner.QueryRow(t.Context(), `SELECT payload::text FROM outbox_events WHERE id = $1`, republished).Scan(&snapshot); err != nil {
+		t.Fatal(err)
+	}
 	copies := 0
 	for _, m := range drain(t, sqsClient(t, "events-reader"), eventsQueue, 3*time.Second) {
 		var e publishedEvent
@@ -198,6 +202,9 @@ func TestEventPublishedButNotConfirmedIsRepublishedWithTheSameID(t *testing.T) {
 			continue
 		}
 		copies++
+		if m.body != snapshot {
+			t.Fatalf("published body differs from the outbox snapshot:\n%s\n%s", m.body, snapshot)
+		}
 		if attribute := m.attributes["eventId"].StringValue; attribute == nil || *attribute != e.EventID {
 			t.Fatal("the eventId message attribute must match the payload")
 		}
