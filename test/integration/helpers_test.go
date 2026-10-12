@@ -296,9 +296,15 @@ type inProcess struct {
 // restricted application role.
 func newInProcess(t *testing.T, policy domain.ReferenceRetryPolicy) inProcess {
 	t.Helper()
+	return newInProcessWithClock(t, policy, app.SystemClock)
+}
+
+// newInProcessWithClock is newInProcess for an instance whose clock differs.
+func newInProcessWithClock(t *testing.T, policy domain.ReferenceRetryPolicy, clock app.Clock) inProcess {
+	t.Helper()
 	metrics := observability.NewMetrics()
 	store := postgres.NewStore(newPool(t, env.appDSN), metrics)
-	service, err := app.NewService(store, policy, app.SystemClock, discardLogger(), metrics)
+	service, err := app.NewService(store, policy, clock, discardLogger(), metrics)
 	if err != nil {
 		t.Fatal(err)
 	}

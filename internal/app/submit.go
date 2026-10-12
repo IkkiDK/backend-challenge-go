@@ -37,6 +37,15 @@ type InboundMessage struct {
 	ReceivedAt time.Time
 }
 
+// completedAt dates the end of handling m at now, unless a wall clock that
+// stepped back would date it before the message was received.
+func (m *InboundMessage) completedAt(now time.Time) time.Time {
+	if now.Before(m.ReceivedAt) {
+		return m.ReceivedAt
+	}
+	return now
+}
+
 // SubmitResult is the outcome of an external operation.
 type SubmitResult struct {
 	Transaction *domain.WagerTransaction
@@ -114,7 +123,7 @@ func (s *Service) submitInUnitOfWork(ctx context.Context, req domain.Transaction
 				Hash:          m.Hash,
 				TransactionID: result.Transaction.ID(),
 				ReceivedAt:    m.ReceivedAt,
-				CompletedAt:   s.clock(),
+				CompletedAt:   m.completedAt(s.clock()),
 			})
 		}
 		return nil
@@ -172,7 +181,7 @@ func (s *Service) recordFailure(ctx context.Context, req domain.TransactionReque
 		if m := origin.Message; m != nil {
 			if err := tx.Inbox().Insert(ctx, InboxRecord{
 				Consumer: m.Consumer, MessageID: m.MessageID, Hash: m.Hash,
-				TransactionID: t.ID(), ReceivedAt: m.ReceivedAt, CompletedAt: now,
+				TransactionID: t.ID(), ReceivedAt: m.ReceivedAt, CompletedAt: m.completedAt(now),
 			}); err != nil {
 				return err
 			}

@@ -200,7 +200,12 @@ func (w *Wallet) move(txID TransactionID, direction Direction, amount money.Mone
 	}
 	w.balance = after
 	w.version = entry.walletVersion
-	w.updatedAt = now
+	// Each instance stamps movements with its own clock, and clocks drift
+	// apart; an instance running behind must not date the wallet back before
+	// an earlier movement or its creation.
+	if now.After(w.updatedAt) {
+		w.updatedAt = now
+	}
 	w.events = append(w.events, newWalletBalanceChanged(entry))
 	return entry, nil
 }
@@ -230,5 +235,6 @@ func (w *Wallet) Version() int64 { return w.version }
 // CreatedAt returns when the wallet was opened.
 func (w *Wallet) CreatedAt() time.Time { return w.createdAt }
 
-// UpdatedAt returns when the balance last changed (or the opening time).
+// UpdatedAt returns when the balance last changed (or the opening time). It
+// never moves back, even when the instances' clocks disagree.
 func (w *Wallet) UpdatedAt() time.Time { return w.updatedAt }

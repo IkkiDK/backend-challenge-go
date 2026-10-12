@@ -7,6 +7,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/IkkiDK/backend-challenge-go/internal/money"
 )
@@ -223,5 +224,26 @@ func TestRehydrateWalletValidatesAndEmitsNothing(t *testing.T) {
 				t.Fatalf("error = %v, want ErrInvalidValue", err)
 			}
 		})
+	}
+}
+
+func TestMovementsNeverDateTheWalletBack(t *testing.T) {
+	w := mustWallet(t, "100.00")
+	behind, ahead := testNow.Add(-5*time.Millisecond), testNow.Add(time.Second)
+
+	if _, err := w.Debit(NewTransactionID(), mustMoney(t, "1.00", "BRL"), behind); err != nil {
+		t.Fatal(err)
+	}
+	if !w.UpdatedAt().Equal(testNow) {
+		t.Fatalf("an instance whose clock is behind dated the wallet %v, before its creation at %v", w.UpdatedAt(), testNow)
+	}
+	if _, err := w.Credit(NewTransactionID(), mustMoney(t, "1.00", "BRL"), ahead); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Debit(NewTransactionID(), mustMoney(t, "1.00", "BRL"), testNow); err != nil {
+		t.Fatal(err)
+	}
+	if !w.UpdatedAt().Equal(ahead) {
+		t.Fatalf("updatedAt moved back to %v after a movement at %v", w.UpdatedAt(), ahead)
 	}
 }
