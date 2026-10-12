@@ -76,19 +76,25 @@ func (o OutboxStore) Claim(ctx context.Context, owner string, limit int, now, le
 	return events, dbError(err)
 }
 
-// MarkPublished is idempotent: a relay that lost its lease and published the
-// event again finds it already marked.
-func (o OutboxStore) MarkPublished(ctx context.Context, id uuid.UUID, at time.Time) error {
-	_, err := o.store.pool.Exec(ctx, `
-		UPDATE outbox_events SET published_at = $2, last_error = NULL
-		WHERE id = $1 AND published_at IS NULL`, id, at)
-	return dbError(err)
+// MarkPublished and Reschedule only touch events the relay still holds: the
+// claim's owner fences a relay whose lease expired, so it can neither shorten
+// the lease of the relay that took an event over nor confirm on its behalf.
+// A relay claims one batch at a time, so its owner name identifies its claim.
+func (o OutboxStore) MarkPublished(ctx context.Context, ids []uuid.UUID, owner string, at time.Time) (int64, error) {
+	keys := make([]string, len(ids))
+	for i, id := range ids {
+		keys[i] = id.String()
+	}
+	tag, err := o.store.pool.Exec(ctx, `
+		UPDATE outbox_events SET published_at = $3, last_error = NULL
+		WHERE id = ANY($1::uuid[]) AND claimed_by = $2 AND published_at IS NULL`, keys, owner, at)
+	return tag.RowsAffected(), dbError(err)
 }
 
-func (o OutboxStore) Reschedule(ctx context.Context, id uuid.UUID, next time.Time, reason string) error {
+func (o OutboxStore) Reschedule(ctx context.Context, id uuid.UUID, owner string, next time.Time, reason string) error {
 	_, err := o.store.pool.Exec(ctx, `
-		UPDATE outbox_events SET next_attempt_at = $2, last_error = $3
-		WHERE id = $1 AND published_at IS NULL`, id, next, reason)
+		UPDATE outbox_events SET next_attempt_at = $3, last_error = $4
+		WHERE id = $1 AND claimed_by = $2 AND published_at IS NULL`, id, owner, next, reason)
 	return dbError(err)
 }
 

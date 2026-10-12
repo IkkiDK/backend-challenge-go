@@ -137,8 +137,8 @@ type crashAfterPublish struct {
 	outbox.Store
 }
 
-func (crashAfterPublish) MarkPublished(context.Context, uuid.UUID, time.Time) error {
-	return errors.New("simulated crash before marking the event published")
+func (crashAfterPublish) MarkPublished(context.Context, []uuid.UUID, string, time.Time) (int64, error) {
+	return 0, errors.New("simulated crash before marking the events published")
 }
 
 // recordingPublisher remembers the event ids it published.
