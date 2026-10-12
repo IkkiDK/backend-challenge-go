@@ -3,7 +3,8 @@
 //
 // Tokens are JWTs validated locally against the provider's published signing
 // keys (JWKS): signature, issuer, audience and expiry. Keys are cached and
-// refetched when an unknown key id appears, so key rotation needs no restart.
+// refetched when a signature does not verify against them, so key rotation
+// needs no restart.
 package auth
 
 import (

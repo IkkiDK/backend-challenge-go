@@ -45,13 +45,13 @@ Every instance runs the same binary: the HTTP API, the SQS consumer, the outbox 
 
 Dependencies point inwards. They are listed outermost first:
 
-- `cmd/wallet`, `internal/bootstrap` (the only package that knows Uber Fx)
-- adapters: `httpapi`, `messaging`, `postgres`, `outbox`, `auth`, `worker`, `config`, `observability`
+- `cmd/wallet`, which runs the application, and `internal/bootstrap`, the composition root; only these two know Uber Fx
+- adapters: `httpapi`, `messaging`, `postgres`, `outbox`, `auth`, `worker`, `config`
 - `internal/app` (use cases and persistence ports)
 - `internal/domain`
 - `internal/money`
 
-The domain imports no framework, transport or database library.
+`internal/observability` (logger fields and Prometheus metrics) is a leaf package that every layer above the domain may use; `internal/app` records its metrics through it. The domain imports no framework, transport or database library.
 
 ## Money
 
@@ -207,8 +207,9 @@ No cycle can form. The retry on `40P01` remains as insurance.
 | One OPENING per wallet; one successful reversal per transaction | Partial unique indexes |
 | One inbox record per consumer and message | Primary key `(consumer_name, message_id)` |
 | Outbox events are immutable snapshots; unpublished events cannot be deleted | Trigger (`WL002`, `WL003`) |
+| The triggers cannot be fooled by a temporary table that shadows a table they read | Every trigger function pins `search_path = public, pg_temp`, and no role but the owner may create temporary tables (migration `000005`) |
 
-**Privileges are part of the protection.** Migrations run as the owner. The service connects as `wallet_app`, which may `SELECT` and `INSERT` and may `UPDATE` only the columns its state machine moves (column-level grants). It cannot update or delete the ledger, delete anything, truncate, alter tables or disable the triggers. Triggers raise SQLSTATE class `WL`, so the service can tell invariant violations from transient errors.
+**Privileges are part of the protection.** Migrations run as the owner. The service connects as `wallet_app`, which may `SELECT` and `INSERT` and may `UPDATE` only the columns its state machine moves (column-level grants). It cannot update or delete the ledger, delete anything, truncate, alter tables, disable the triggers or create temporary tables (`TestTemporaryTablesCannotShadowWhatTheTriggersCheck`). Triggers raise SQLSTATE class `WL`, so the service can tell invariant violations from transient errors.
 
 `TestCorruptedBalanceIsCaughtByTheDatabaseAndByReconciliation` shows the layers together:
 
@@ -234,7 +235,7 @@ No cycle can form. The retry on `40P01` remains as insurance.
   1. A lock-free lookup answers most replays.
   2. Otherwise the unit of work locks the wallet and looks again, since whatever committed before is now visible.
   3. If still absent, it settles.
-  4. A concurrent duplicate whose wallet differs (so no shared lock) loses on the unique index and replays the winner in a fresh unit of work.
+  4. Two concurrent requests that share a key, an operation id or a `messageId` but name different wallets take no common lock. The second insert hits the unique index, and a fresh unit of work finds the first one and answers `409` (`IDEMPOTENCY_KEY_REUSED` or `EXTERNAL_TRANSACTION_CONFLICT`; over SQS, a `message_id_reused` dead-letter), because the wallet is part of the fingerprint. Identical requests name the same wallet, so they serialize on its lock and are replayed at step 2.
 - **Persistence:** keys live only in PostgreSQL, so idempotency survives restarts (`TestRestartPreservesIdempotencyAndResumesPendingReferences`).
 
 ## Pending references
@@ -278,7 +279,7 @@ The service does not depend on either: invariants are enforced by the database, 
 | Retries exhausted | After `maxReceiveCount = 5` receives, SQS moves it to `wager-transactions-dlq.fifo` |
 | Permanent failure: invalid message, unknown wallet, idempotency conflict, `messageId` reused with other content, or a `FAILED` outcome | Copied to the DLQ at once with `deadLetterReason`, `deadLetterError` and `sourceMessageId` attributes, then deleted. If the copy fails, the message is retried instead |
 
-**Timeouts:** the queue's visibility timeout is 30 s. Handling one message is bounded by `CONSUMER_PROCESSING_TIMEOUT` (10 s), and startup refuses a processing timeout that is not below the visibility timeout. So a message never becomes visible to another consumer while it is still being handled.
+**Timeouts:** the queue's visibility timeout is 30 s. Handling one message is bounded by `CONSUMER_PROCESSING_TIMEOUT` (10 s), and startup refuses a processing timeout that is not below the visibility timeout. The bound is per message, while visibility starts when a batch is received: when the database is slow, a message late in its group, or waiting for a free group slot, can outlive its visibility timeout and be delivered to another consumer while still being handled. That second delivery is harmless, because the wallet lock serializes the two and the inbox key turns the later one into a replay.
 
 **Shutdown (SIGTERM):**
 
@@ -296,18 +297,23 @@ The poll is deliberately not cancelled: a long poll abandoned by its client can 
 
 **Relay:** each instance runs one, and any number can run.
 
-1. **Claim:** a short transaction claims due events with `FOR UPDATE SKIP LOCKED`, sets `attempts + 1`, `claimed_by`, and a lease (`next_attempt_at = now + OUTBOX_LEASE`), then commits. No lock is held while publishing.
+1. **Claim:** a short transaction claims up to `OUTBOX_BATCH_SIZE` due events with `FOR UPDATE SKIP LOCKED`, sets `attempts + 1`, `claimed_by`, and a lease (`next_attempt_at = now + OUTBOX_LEASE`), then commits. No lock is held while publishing.
 2. **Ordering:** the claim only takes, per ordering key (the wallet), the oldest unpublished event. Events of one wallet are therefore published in commit order by any number of relays. The sequence is assigned under the wallet's row lock, so sequence order is commit order within a wallet.
-3. **Publish:** to `wallet-events.fifo` with `MessageGroupId = walletId`, `MessageDeduplicationId = eventId`, and attributes `eventId`, `eventType`, `eventVersion`, `aggregateId`, within `OUTBOX_PUBLISH_TIMEOUT`.
-4. **Confirm:** mark it `published_at`. A failed publication is rescheduled with exponential backoff (`OUTBOX_RETRY_BASE_DELAY`, capped at `OUTBOX_RETRY_MAX_DELAY`) and retried forever: a committed event is never dropped, and the lag metric exposes a stuck one.
+3. **Publish:** a batch holds at most one event per wallet, so all of its events are published **concurrently** without reordering any wallet's events: to `wallet-events.fifo` with `MessageGroupId = walletId`, `MessageDeduplicationId = eventId`, and attributes `eventId`, `eventType`, `eventVersion`, `aggregateId`, each within `OUTBOX_PUBLISH_TIMEOUT`. Publishing one after another would cap a relay at one broker round trip per event.
+4. **Confirm:** one statement marks the batch's publications `published_at`, using one database connection however large the batch. A failed publication is rescheduled with exponential backoff (`OUTBOX_RETRY_BASE_DELAY`, capped at `OUTBOX_RETRY_MAX_DELAY`) and retried forever: a committed event is never dropped, and the lag metric exposes a stuck one.
+5. **Fencing:** confirmations and reschedules only touch events whose `claimed_by` is still the relay. A relay whose lease expired and passed to another relay can neither confirm the event on its behalf nor shorten its lease (`TestARelayThatLostItsLeaseCannotTouchTheEvent`). Each of these writes is bounded by `OUTBOX_PUBLISH_TIMEOUT`, even during shutdown: a frozen database delays a relay's stop by at most two such timeouts, releasing what it could not publish and then confirming what it did, instead of hanging it.
+
+**Claim cost:** the claim walks pending events in commit order through a partial index that holds pending events only (`outbox_events_pending`, migration `000006`). Before it, the claim walked the unique index on `sequence` from the start, through every published event: about 7 ms per 100,000 published events after vacuum and 44 ms before, on every claim of every relay, idle polls included, and growing forever because nothing prunes the outbox. `TestClaimsDoNotReadThePublishedHistory` fails without the index.
+
+One cost remains. While fewer wallets than `OUTBOX_BATCH_SIZE` have a claimable oldest event, the claim reads the whole pending backlog trying to fill its batch: about 0.5 s at 80,000 events held by four wallets. That takes a few wallets each producing more events than a relay publishes for one wallet (one per claim, publish and confirm round trip), far beyond a player's pace; the contention scenario of [LOADTEST.md](LOADTEST.md) provokes it on purpose. Limiting the claim to a window of the oldest pending events was tried and rejected: one deep wallet at the front of the window blocked every other wallet's events until its whole backlog drained. The remedies are a loose index scan over the wallets with pending events, which costs one index probe per such wallet, or claiming a run of consecutive events per wallet and publishing them in order.
 
 **Recovery of abandoned work:**
 
 - **Relay crash:** the lease expires and another relay claims the event again (`attempts` shows it).
 - **Commit → publish:** the event waits in the table for any relay.
-- **Publish → confirm:** the event is published again **with the same `eventId`**; the FIFO queue drops it within 5 minutes, and consumers deduplicate by id beyond that.
+- **Publish → confirm:** the event is published again **with the same `eventId`**, by the relay that holds it once the lease expires; the FIFO queue drops it within 5 minutes, and consumers deduplicate by id beyond that.
 - **Shutdown:** a relay hands back the events it claimed but did not publish.
-- **Tests:** `TestCompetingPublishersPublishEveryEventOnceInWalletOrder` and `TestEventPublishedButNotConfirmedIsRepublishedWithTheSameID`.
+- **Tests:** `TestCompetingPublishersPublishEveryEventOnceInWalletOrder`, `TestEventPublishedButNotConfirmedIsRepublishedWithTheSameID` and `TestARelayThatLostItsLeaseCannotTouchTheEvent`; the unit tests in `internal/outbox` prove that a batch is published concurrently and confirmed in one write, that failures are rescheduled with backoff, and that a stop releases what was not published.
 
 **Snapshot:** the payload is the serialized envelope, stored in a `json` column (not `jsonb`) so the exact bytes are kept and every publication is identical. A trigger forbids changing it.
 
@@ -358,7 +364,7 @@ Envelope (type and version come from the event type itself; timestamps are RFC 3
 - `aud` containing `wallet-api`, so tokens minted for other services (`foreign-service`) are refused;
 - `exp`, with no leeway.
 
-Keys are cached and refetched when an unknown key id appears, so key rotation needs no restart. Local validation needs no Keycloak round trip per request and keeps working through short IdP outages. The trade-off is that a revoked token stays valid until it expires, which is why the realm issues 5-minute tokens. Introspection (RFC 7662) would close that gap at the cost of a network call per request. Startup checks that the JWKS is reachable.
+Keys are cached and refetched when a signature does not verify against them, so key rotation needs no restart. Local validation needs no Keycloak round trip per request and keeps working through short IdP outages. The trade-off is that a revoked token stays valid until it expires, which is why the realm issues 5-minute tokens. Introspection (RFC 7662) would close that gap at the cost of a network call per request. Startup checks that the JWKS is reachable.
 
 **Permission model:**
 
@@ -372,27 +378,30 @@ Keys are cached and refetched when an unknown key id appears, so key rotation ne
   - replays can never cross providers, because idempotency keys are provider-scoped;
   - only `wagering:read-all` (internal services) sees every provider and the OPENING transactions.
 - **Wallet operations** (open, read, ledger, reconcile) require `wallets:*` scopes, which only the internal `wallet-backoffice` client has.
+- **Wallets are the operator's and shared by every provider:** a provider moves a wallet by naming both its `walletId` and its `playerId`, which must match (`WALLET_PLAYER_MISMATCH` otherwise, answered without the wallet's balance). Binding players to the providers they play with would need an operator-issued game-session claim, which is outside this service; rate limits and alerts on payouts are the compensating controls.
 - **Forged identity:** a token whose `provider_id` was edited fails signature validation (`TestInvalidCredentialsAreRejectedWithoutEffects`).
 
 **Broker access:**
 
-- SQS access is granted by IAM, enforced by MiniStack (`AUTH=true`: SigV4 signatures are verified and IAM policies evaluated).
+- SQS access is granted by IAM and enforced by MiniStack (`AUTH=true`): every access key maps to its IAM user, whose policy is evaluated on each call. Unlike AWS, MiniStack does not verify the request signature, so locally an access key id alone identifies a caller.
 - The service uses the `wallet-service` identity: consume inbound, send to the DLQ, publish events.
-- Producers use `wager-producer`, which can only send to the inbound queue; downstream consumers use `events-reader`.
-- Each identity's policy names exact queue ARNs.
+- The provider gateway uses `wager-producer`, which can only send to the inbound queue; downstream consumers use `events-reader`.
+- Each identity's policy names exact queue ARNs, and `TestBrokerPoliciesRefuseWhatAnIdentityWasNotGranted` proves the broker refuses each identity what it was not granted, and refuses unknown keys.
+
+**Provider identity on the queue (a trust boundary):** the challenge's message contract carries the provider in `data.providerId` and names a single inbound queue, so a message carries no credential of the provider itself. The trust boundary is therefore the `wager-producer` identity: it belongs to the internal provider gateway, which authenticates each provider before it enqueues on its behalf. Anyone holding that identity could submit for any provider, so it must stay with the gateway alone. Two production designs bind the provider to the message instead: one queue and one IAM identity per provider, with the consumer deriving the provider from the queue; or the `SenderId` system attribute (the sending IAM principal) mapped to a provider. Both change the contract the challenge fixes, and MiniStack reports the account rather than the user as `SenderId`, so this repository keeps the gateway boundary and documents it.
 
 The consumer still applies every domain validation (schema, money, kind, references, the wallet's player and currency) to what it receives.
 
 ## Composition and lifecycle with Fx
 
-`internal/bootstrap` composes everything from plain constructors with `fx.Module`, `fx.Provide` and `fx.Invoke`. The modules are observability, database, auth, application, messaging, workers (conditional on configuration) and http.
+`internal/bootstrap` composes everything from plain constructors with `fx.Module`, `fx.Provide` and `fx.Invoke`. The modules are observability, database, auth, application, messaging, dependencies, workers (conditional on configuration) and http.
 
 - **Startup:**
   - configuration is loaded and validated before Fx starts, and every invalid variable is reported at once;
   - start hooks wait for PostgreSQL, SQS (queue resolution through IAM, inbound visibility timeout and redrive policy) and the JWKS, with retries bounded by `START_TIMEOUT`;
   - the HTTP server binds its port in its start hook, so a taken port fails startup.
 - **Hook order:**
-  - dependencies register their hooks first, then the internal workers (reference worker, outbox relay and its backlog gauge), then the inputs: the consumer and the HTTP server;
+  - dependencies register their hooks first, then the internal workers (reference worker, outbox relay and its backlog gauge), then the inputs: the consumer and the HTTP server. Fx runs a constructor, which registers its hook, only when something first needs it, so the `dependencies` module requires PostgreSQL, the identity provider and SQS before the workers module runs (`TestDependencyChecksStartBeforeTheWorkers`);
   - Fx stops in reverse, so on SIGTERM the HTTP server and the consumer stop taking work first and the workers stop after them;
   - the connection pool closes last, once nothing uses it.
 - **Shutdown of each component** (within `SHUTDOWN_TIMEOUT`):
@@ -402,7 +411,8 @@ The consumer still applies every domain validation (schema, money, kind, referen
 - **Observable termination:** `Stop` of every loop and of the consumer returns only after its goroutine has exited (or reports that the deadline cancelled its work), and each logs `worker stopped` / `consumer stopped`.
 - **Tests:**
   - `TestFxApplicationStartsServesAndStopsWithoutLeakingGoroutines` starts the composed application against the containers, uses it, stops it, and asserts with goleak that no goroutine of the service survives;
-  - `TestDependencyGraphIsComplete` validates the graph for every combination of enabled components.
+  - `TestDependencyGraphIsComplete` validates the graph for every combination of enabled components;
+  - `TestStoppingTheConsumerReleasesWhatItHasNotFinished` stops a consumer whose message waits on a wallet lock: its unit of work rolls back, both messages are released at once, and another consumer settles them in order.
 
 ## Failure handling summary
 
@@ -416,6 +426,8 @@ The consumer still applies every domain validation (schema, money, kind, referen
 | Integrity violation: SQLSTATE class `23`, `22` or `WL`, meaning the operation's own data breaks an invariant | **Permanent** | Recorded `FAILED`, 500 | Recorded `FAILED`, dead-letter | Recorded `FAILED` |
 
 Deployment faults are deliberately transient: a missing privilege must not burn customers' transactions as `FAILED`.
+
+**Slow and idle clients:** the HTTP server bounds every phase of a connection (`HTTP_READ_HEADER_TIMEOUT`, `HTTP_READ_TIMEOUT`, `HTTP_WRITE_TIMEOUT`, `HTTP_IDLE_TIMEOUT`) and caps headers at 32 KiB. A request context is bounded by `HTTP_REQUEST_TIMEOUT`, but a context cannot interrupt a blocked body read, and Go drains an unread body before answering: without a read timeout, a client that sends headers and then stalls would hold its connection forever, even when it is refused with `401`.
 
 ## Observability
 
@@ -441,18 +453,19 @@ Deployment faults are deliberately transient: a missing privilege must not burn 
 - **References on LOSS:** a LOSS cannot carry a reference (only WIN, REFUND and ROLLBACK can), so the request is refused rather than the reference silently ignored.
 - **Recording rule:** unknown wallets are not recorded (there is nothing to attach them to). Correctable rejections are recorded, so a provider retries with a new `externalTransactionId`.
 - **FAILED outcomes** are dead-lettered as well as recorded, so operators see them in the queue.
+- **Provider on the queue:** taken from `data.providerId`, behind the provider gateway's broker identity (see [Authentication and authorization](#authentication-and-authorization)).
 
 **Limitations:**
 
-- **SQS provider authenticity:** SQS messages carry no caller identity the service can verify. Broker policies restrict who may publish, and the consumer validates the content, but a compromised producer identity could submit for any provider. On AWS, the `SenderId` system attribute (mapped to a provider) or one queue per provider with its own policy would close this gap. MiniStack reports the account as `SenderId`, so it could not be demonstrated.
-- **Broker state:** MiniStack keeps no state. Restarting it re-provisions the queues with new access keys, so the instances must be restarted too. Keycloak runs in dev mode with its embedded database, for local use only.
+- **Broker emulation:** MiniStack enforces IAM policies but does not verify request signatures, so local tests prove authorization, not signature checking. It also keeps no state. Restarting it re-provisions the queues with new access keys, so the instances must be restarted too. Keycloak runs in dev mode with its embedded database, for local use only.
 - **Retention:** there is no outbox or inbox retention job. Published events may be pruned (the trigger allows it); unpublished ones may not.
-- **Clocks:** each instance timestamps with its own NTP-synced clock. Skew only shifts retry and lease timing (a lease could be taken over early, producing a duplicate publication with the same `eventId`), never correctness.
+- **Clocks:** each instance timestamps with its own clock. A wallet's `updatedAt` and an inbox record's completion never move back before an earlier timestamp, so skew between instances, or a wall clock stepping back, cannot fail an operation (`TestInstancesWhoseClocksDisagreeStillSettle`). Skew still shifts retry and lease timing: a lease taken over early produces at most a duplicate publication with the same `eventId`.
+- **Identity provider load:** go-oidc refetches the key set whenever a signature does not verify, so a flood of tokens with bad signatures costs each instance one JWKS fetch at a time (concurrent misses share a fetch). A minimum interval between refetches would bound it.
+- **Hot wallets and the outbox:** a few wallets with a deep backlog of unpublished events make each claim read that backlog; see [Transactional outbox](#transactional-outbox), claim cost.
+- **Ledger cursors:** a cursor is the base64url of a wallet version, opaque but not signed. A caller that can read a ledger can craft a cursor into it, which reveals nothing it could not page to.
 - **Rate limiting:** there is none per provider.
 
-**Optional items not done:**
+**Optional items:**
 
-- OpenTelemetry tracing (correlation ids are propagated, but there are no spans);
-- dashboards;
-- a load-test harness with reproducible throughput and p50/p95/p99 figures (the integration test runs 100 bets on 20 wallets across 3 instances in about 0.2 s, which is not a benchmark);
-- a double-entry ledger.
+- **Done:** a reproducible load test with throughput, p50/p95/p99, errors, conflicts and outbox lag; see [LOADTEST.md](LOADTEST.md).
+- **Not done:** OpenTelemetry tracing (correlation ids are propagated, but there are no spans), dashboards, and a double-entry ledger.
