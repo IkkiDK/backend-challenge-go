@@ -60,14 +60,14 @@ func TestMigrationsApplyAndRevertOnAFreshDatabase(t *testing.T) {
 	if err := m.Up(); err != nil {
 		t.Fatalf("up: %v", err)
 	}
-	if version, dirty, err := m.Version(); err != nil || dirty || version != 5 || tables() != 5 {
+	if version, dirty, err := m.Version(); err != nil || dirty || version != 6 || tables() != 5 {
 		t.Fatalf("after up: version %d dirty %t err %v tables %d", version, dirty, err, tables())
 	}
 	if err := m.Steps(-1); err != nil {
 		t.Fatalf("down 1: %v", err)
 	}
-	if version, _, _ := m.Version(); version != 4 {
-		t.Fatalf("after down 1: version %d, want 4", version)
+	if version, _, _ := m.Version(); version != 5 {
+		t.Fatalf("after down 1: version %d, want 5", version)
 	}
 	if err := m.Down(); err != nil {
 		t.Fatalf("down all: %v", err)
