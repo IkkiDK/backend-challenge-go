@@ -399,7 +399,7 @@ The consumer still applies every domain validation (schema, money, kind, referen
   - **HTTP server:** readiness switches to `DRAINING` (load balancers stop routing), `Shutdown` stops accepting connections and waits for in-flight requests, and stragglers are cut at the deadline.
   - **Consumer:** see [SQS consumer](#sqs-consumer).
   - **Workers:** each loop finishes its current step and exits; at the deadline the step's context is cancelled, so its SQL transaction rolls back and its claims are released.
-- **Observable termination:** every loop and the consumer expose `Done()` and log `worker stopped` / `consumer stopped`, and `Stop` returns only after their goroutine has exited.
+- **Observable termination:** `Stop` of every loop and of the consumer returns only after its goroutine has exited (or reports that the deadline cancelled its work), and each logs `worker stopped` / `consumer stopped`.
 - **Tests:**
   - `TestFxApplicationStartsServesAndStopsWithoutLeakingGoroutines` starts the composed application against the containers, uses it, stops it, and asserts with goleak that no goroutine of the service survives;
   - `TestDependencyGraphIsComplete` validates the graph for every combination of enabled components.

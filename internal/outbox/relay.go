@@ -23,8 +23,7 @@ type Event struct {
 	AggregateID  string
 	Payload      []byte
 	// Attempts counts claims, including the current one.
-	Attempts   int
-	OccurredAt time.Time
+	Attempts int
 }
 
 // Store is the outbox persistence the relay needs.

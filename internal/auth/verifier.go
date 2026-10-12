@@ -55,7 +55,6 @@ type Config struct {
 
 // Principal is an authenticated caller.
 type Principal struct {
-	Subject  string
 	ClientID string
 	// ProviderID is the game provider the client acts for; zero for
 	// internal services. It comes from the token, never from the request.
@@ -124,7 +123,6 @@ func (v *Verifier) Verify(ctx context.Context, rawToken string) (Principal, erro
 		return Principal{}, fmt.Errorf("%w: claims: %w", ErrInvalidToken, err)
 	}
 	principal := Principal{
-		Subject:  token.Subject,
 		ClientID: claims.AuthorizedParty,
 		scopes:   make(map[string]bool),
 	}

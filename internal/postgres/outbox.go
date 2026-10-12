@@ -63,14 +63,14 @@ func (o OutboxStore) Claim(ctx context.Context, owner string, limit int, now, le
 		SET attempts = e.attempts + 1, next_attempt_at = $3, claimed_by = $4
 		FROM due
 		WHERE e.id = due.id
-		RETURNING e.id, e.ordering_key, e.event_type, e.event_version, e.aggregate_id, e.payload, e.attempts, e.occurred_at`,
+		RETURNING e.id, e.ordering_key, e.event_type, e.event_version, e.aggregate_id, e.payload, e.attempts`,
 		now, limit, leaseUntil, owner)
 	if err != nil {
 		return nil, dbError(err)
 	}
 	events, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (outbox.Event, error) {
 		var e outbox.Event
-		err := row.Scan(&e.ID, &e.OrderingKey, &e.EventType, &e.EventVersion, &e.AggregateID, &e.Payload, &e.Attempts, &e.OccurredAt)
+		err := row.Scan(&e.ID, &e.OrderingKey, &e.EventType, &e.EventVersion, &e.AggregateID, &e.Payload, &e.Attempts)
 		return e, err
 	})
 	return events, dbError(err)

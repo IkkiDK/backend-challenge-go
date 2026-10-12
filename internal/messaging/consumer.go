@@ -103,11 +103,6 @@ func (c *Consumer) Stop(ctx context.Context) error {
 	}
 }
 
-// Done is closed once the consumer has fully stopped.
-func (c *Consumer) Done() <-chan struct{} {
-	return c.done
-}
-
 func (c *Consumer) run() {
 	defer close(c.done)
 	for !c.isStopping() {

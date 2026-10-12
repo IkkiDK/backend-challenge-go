@@ -62,11 +62,6 @@ func (l *Loop) Stop(ctx context.Context) error {
 	}
 }
 
-// Done is closed once the loop has exited.
-func (l *Loop) Done() <-chan struct{} {
-	return l.done
-}
-
 func (l *Loop) run() {
 	defer close(l.done)
 	backoff := l.idle
