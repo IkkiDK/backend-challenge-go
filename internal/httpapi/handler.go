@@ -154,7 +154,8 @@ func (h handlers) submitTransaction(w http.ResponseWriter, r *http.Request) {
 	if !decodeBody(w, r, &body) {
 		return
 	}
-	if body.ProviderID != principal.ProviderID.String() {
+	// A missing providerId is a validation error below; another provider's is forbidden.
+	if body.ProviderID != "" && body.ProviderID != principal.ProviderID.String() {
 		writeProblem(w, r, http.StatusForbidden, codeForbidden, "providerId must be the provider of the access token")
 		return
 	}
