@@ -7,8 +7,9 @@
 *.out
 coverage.*
 
-# Local environment overrides
+# Local environment overrides and generated broker credentials
 .env
+.aws-credentials
 
 # Editors
 .idea/
