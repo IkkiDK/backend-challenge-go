@@ -22,8 +22,6 @@ import (
 const (
 	// maxMessagesPerReceive is the SQS maximum for one ReceiveMessage call.
 	maxMessagesPerReceive = 10
-	// longPollSeconds is the SQS maximum long-polling wait.
-	longPollSeconds = 20
 	// sqsCallTimeout bounds delete, visibility and dead-letter calls.
 	sqsCallTimeout = 5 * time.Second
 	// receiveErrorBackoff spaces receive retries while SQS is unreachable.
@@ -42,8 +40,12 @@ const (
 // messages, conflicts, unknown wallets) are dead-lettered at once.
 //
 // Messages of one group (one wallet) are handled in order, groups in
-// parallel. On Stop the consumer stops receiving, finishes in-flight messages
-// within the deadline and makes the remaining ones visible again.
+// parallel. On Stop the consumer starts no new receive, lets the long poll in
+// flight return (at most cfg.WaitTime) and hands back what it brought,
+// finishes in-flight messages within the deadline and makes the remaining
+// ones visible again. The poll is not cancelled: a long poll abandoned by its
+// client can still receive messages server-side, which would then stay
+// invisible for the whole visibility timeout.
 type Consumer struct {
 	client  *sqs.Client
 	broker  *Broker
@@ -85,9 +87,9 @@ func (c *Consumer) Start() error {
 	return nil
 }
 
-// Stop stops receiving at once and waits for in-flight messages until ctx
-// expires; then it cancels them (their SQL transactions roll back) and
-// releases them for redelivery.
+// Stop waits until the receive in flight returned and the in-flight messages
+// were handled or released. If ctx expires first, it cancels them (their SQL
+// transactions roll back and they are released for redelivery).
 func (c *Consumer) Stop(ctx context.Context) error {
 	c.stopOnce.Do(func() { close(c.stopping) })
 	defer c.logger.Info("consumer stopped")
@@ -108,21 +110,11 @@ func (c *Consumer) Done() <-chan struct{} {
 
 func (c *Consumer) run() {
 	defer close(c.done)
-	receiving, stopReceiving := context.WithCancel(c.work)
-	defer stopReceiving()
-	go func() {
-		select {
-		case <-c.stopping:
-			stopReceiving()
-		case <-receiving.Done():
-		}
-	}()
-
-	for receiving.Err() == nil {
-		out, err := c.client.ReceiveMessage(receiving, &sqs.ReceiveMessageInput{
+	for !c.isStopping() {
+		out, err := c.client.ReceiveMessage(c.work, &sqs.ReceiveMessageInput{
 			QueueUrl:            aws.String(c.queues.InboundURL),
 			MaxNumberOfMessages: maxMessagesPerReceive,
-			WaitTimeSeconds:     longPollSeconds,
+			WaitTimeSeconds:     int32(c.cfg.WaitTime / time.Second),
 			MessageSystemAttributeNames: []types.MessageSystemAttributeName{
 				types.MessageSystemAttributeNameApproximateReceiveCount,
 				types.MessageSystemAttributeNameMessageGroupId,
@@ -130,16 +122,20 @@ func (c *Consumer) run() {
 			MessageAttributeNames: []string{correlationAttribute},
 		})
 		if err != nil {
-			if receiving.Err() != nil {
+			if c.work.Err() != nil {
 				return
 			}
 			c.metrics.Retries.WithLabelValues("sqs_receive").Inc()
 			c.logger.Warn("receive failed; retrying", "error", err)
 			select {
-			case <-receiving.Done():
+			case <-c.stopping:
 			case <-time.After(receiveErrorBackoff):
 			}
 			continue
+		}
+		if c.isStopping() {
+			c.release(out.Messages)
+			return
 		}
 		c.handleBatch(out.Messages)
 	}

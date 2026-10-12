@@ -35,6 +35,7 @@ func TestLoadReportsEveryProblem(t *testing.T) {
 	_, err := Load(env(map[string]string{
 		"INSTANCE_ID":                "wallet-1",
 		"CONSUMER_CONCURRENCY":       "0",
+		"CONSUMER_WAIT_TIME":         "25s",
 		"OUTBOX_LEASE":               "1s",
 		"OUTBOX_PUBLISH_TIMEOUT":     "5s",
 		"REFERENCE_MAX_ATTEMPTS":     "zero",
@@ -50,7 +51,7 @@ func TestLoadReportsEveryProblem(t *testing.T) {
 	}
 	for _, want := range []string{
 		"DATABASE_URL is required", "OIDC_ISSUER is required", "OIDC_JWKS_URL is required",
-		"CONSUMER_CONCURRENCY", "outbox lease", "REFERENCE_MAX_ATTEMPTS", "HTTP_REQUEST_TIMEOUT",
+		"CONSUMER_CONCURRENCY", "CONSUMER_WAIT_TIME", "outbox lease", "REFERENCE_MAX_ATTEMPTS", "HTTP_REQUEST_TIMEOUT",
 		"CONSUMER_RETRY_BASE_DELAY", "LOG_LEVEL", "REFERENCE_WORKER_ENABLED", "reference retry policy",
 	} {
 		if !strings.Contains(err.Error(), want) {

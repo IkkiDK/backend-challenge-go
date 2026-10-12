@@ -16,6 +16,9 @@ import (
 	"github.com/IkkiDK/backend-challenge-go/internal/postgres"
 )
 
+// maxLongPollWait is the SQS limit of WaitTimeSeconds.
+const maxLongPollWait = 20 * time.Second
+
 // Config is the complete service configuration.
 type Config struct {
 	InstanceID      string
@@ -56,6 +59,9 @@ type Consumer struct {
 	Name string
 	// Concurrency is how many message groups (wallets) are handled at once.
 	Concurrency int
+	// WaitTime is the long-polling wait of each receive, which also bounds
+	// how long shutdown waits for the receive in flight.
+	WaitTime time.Duration
 	// ProcessingTimeout bounds the handling of one message; it must stay
 	// below the queue's visibility timeout.
 	ProcessingTimeout time.Duration
@@ -119,6 +125,7 @@ func Load(getenv func(string) string) (Config, error) {
 			Enabled:           l.bool("CONSUMER_ENABLED", true),
 			Name:              l.string("CONSUMER_NAME", "wallet-service.wager-transactions"),
 			Concurrency:       l.int("CONSUMER_CONCURRENCY", 8),
+			WaitTime:          l.duration("CONSUMER_WAIT_TIME", 10*time.Second),
 			ProcessingTimeout: l.duration("CONSUMER_PROCESSING_TIMEOUT", 10*time.Second),
 			RetryBaseDelay:    l.duration("CONSUMER_RETRY_BASE_DELAY", 2*time.Second),
 			RetryMaxDelay:     l.duration("CONSUMER_RETRY_MAX_DELAY", 60*time.Second),
@@ -149,6 +156,8 @@ func Load(getenv func(string) string) (Config, error) {
 	l.check(cfg.Database.MaxConns > 0, "DATABASE_MAX_CONNS must be positive")
 	l.check(cfg.Consumer.Concurrency > 0, "CONSUMER_CONCURRENCY must be positive")
 	l.check(cfg.Consumer.ProcessingTimeout > 0, "CONSUMER_PROCESSING_TIMEOUT must be positive")
+	l.check(cfg.Consumer.WaitTime >= 0 && cfg.Consumer.WaitTime <= maxLongPollWait && cfg.Consumer.WaitTime%time.Second == 0,
+		"CONSUMER_WAIT_TIME must be whole seconds from 0s to 20s")
 	l.check(cfg.Consumer.RetryBaseDelay > 0 && cfg.Consumer.RetryMaxDelay >= cfg.Consumer.RetryBaseDelay,
 		"CONSUMER_RETRY_BASE_DELAY must be positive and not above CONSUMER_RETRY_MAX_DELAY")
 	l.check(cfg.HTTP.RequestTimeout > 0 && cfg.ShutdownTimeout > 0 && cfg.StartTimeout > 0,
