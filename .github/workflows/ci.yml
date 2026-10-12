@@ -1,0 +1,68 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    name: format, vet and unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: gofmt
+        run: test -z "$(gofmt -l . | tee /dev/stderr)"
+      - name: go vet
+        run: go vet ./... && go vet -tags=integration ./...
+      - name: unit tests with the race detector
+        run: go test -race -count=1 ./...
+
+  integration:
+    name: integration tests (PostgreSQL, Keycloak, MiniStack)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: integration tests with the race detector
+        run: go test -race -tags=integration -count=1 -timeout 20m ./test/integration/...
+
+  compose:
+    name: docker compose smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: start the stack
+        run: docker compose up --build -d --wait
+      - name: call every instance
+        run: |
+          for port in 8081 8082 8083; do
+            curl -fsS "localhost:$port/health/ready"; echo
+          done
+          token() {
+            curl -fsS localhost:8180/realms/wallet/protocol/openid-connect/token \
+              -d grant_type=client_credentials -d client_id="$1" -d client_secret="$1-local-secret" | jq -r .access_token
+          }
+          wallet=$(curl -fsS -X POST localhost:8081/wallets -H "Authorization: Bearer $(token wallet-backoffice)" \
+            -H 'Content-Type: application/json' \
+            -d "{\"playerId\":\"$(cat /proc/sys/kernel/random/uuid)\",\"initialBalance\":{\"amount\":\"100.00\",\"currency\":\"BRL\"}}")
+          wallet_id=$(echo "$wallet" | jq -r .id); player_id=$(echo "$wallet" | jq -r .playerId)
+          bet=$(curl -fsS -X POST localhost:8082/wagering/transactions -H "Authorization: Bearer $(token provider-a)" \
+            -H 'Content-Type: application/json' -H 'Idempotency-Key: provider-a:ci-bet' \
+            -d "{\"providerId\":\"provider-a\",\"externalTransactionId\":\"ci-bet\",\"playerId\":\"$player_id\",\"walletId\":\"$wallet_id\",\"roundId\":\"r1\",\"gameId\":\"g1\",\"kind\":\"BET\",\"money\":{\"amount\":\"25.00\",\"currency\":\"BRL\"}}")
+          echo "$bet"
+          test "$(echo "$bet" | jq -r .balance.amount)" = "75.00"
+      - name: logs
+        if: failure()
+        run: docker compose logs
+      - name: stop the stack
+        if: always()
+        run: docker compose down -v
