@@ -179,7 +179,7 @@ func newWagerTransactionPendingReference(t *WagerTransaction) WagerTransactionPe
 		Kind:                           t.kind,
 		Money:                          t.money,
 		ReferenceExternalTransactionID: t.ReferenceExternalTransactionID(),
-		NextAttemptAt:                  t.nextAttemptAt,
+		NextAttemptAt:                  t.nextAttemptAt.UTC(),
 		providerFields:                 providerFieldsOf(t),
 	}
 }

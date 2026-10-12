@@ -33,8 +33,8 @@ const (
 // envelope, key by key and value by value, with the documented contract.
 // Renaming or dropping a key, or publishing money as a number, breaks it.
 func TestPublishedEventsKeepTheirContract(t *testing.T) {
-	// The opening is recorded by a clock in another zone; its events must still
-	// be published in UTC.
+	// The opening and the pending reversal are recorded by a clock in another
+	// zone; their events must still be published in UTC.
 	otherZone := time.FixedZone("UTC-3", int((-3 * time.Hour).Seconds()))
 	opening, err := OpenWallet(OpenWalletParams{
 		ID:                   mustParse(t, ParseWalletID, testWalletID),
@@ -50,17 +50,18 @@ func TestPublishedEventsKeepTheirContract(t *testing.T) {
 	w := opening.Wallet
 	openingEvents := append(w.PullEvents(), opening.Opening.PullEvents()...)
 
-	bet := contractSettle(t, w, contractBetID, betInput("bet-1", "10.00"), ReferenceState{})
+	bet := contractSettle(t, w, contractBetID, betInput("bet-1", "10.00"), ReferenceState{}, contractClock)
 	betEvents := append(w.PullEvents(), bet.PullEvents()...)
 
-	win := contractSettle(t, w, contractWinID, operationInput(KindWin, "win-1", "30.00", "bet-1"), ReferenceState{Transaction: bet})
+	win := contractSettle(t, w, contractWinID, operationInput(KindWin, "win-1", "30.00", "bet-1"), ReferenceState{Transaction: bet}, contractClock)
 	winEvents := append(w.PullEvents(), win.PullEvents()...)
 
 	rejected := contractSettle(t, w, contractRejectedID, operationInput(KindRefund, "refund-1", "10.00", "bet-1"),
-		ReferenceState{Transaction: bet, Reversed: true})
+		ReferenceState{Transaction: bet, Reversed: true}, contractClock)
 	rejectedEvents := append(w.PullEvents(), rejected.PullEvents()...)
 
-	pending := contractSettle(t, w, contractPendingID, operationInput(KindRefund, "refund-2", "5.00", "bet-2"), ReferenceState{})
+	pending := contractSettle(t, w, contractPendingID, operationInput(KindRefund, "refund-2", "5.00", "bet-2"), ReferenceState{},
+		contractClock.In(otherZone))
 	pendingEvents := append(w.PullEvents(), pending.PullEvents()...)
 
 	fromProvider := func(externalID string) map[string]any {
@@ -207,15 +208,15 @@ func TestPublishedEventsKeepTheirContract(t *testing.T) {
 	}
 }
 
-// contractSettle settles a transaction with a fixed id at contractClock and
-// requires the domain to accept the inputs.
-func contractSettle(t *testing.T, w *Wallet, id string, in TransactionRequestInput, ref ReferenceState) *WagerTransaction {
+// contractSettle settles a transaction with a fixed id at now and requires
+// the domain to accept the inputs.
+func contractSettle(t *testing.T, w *Wallet, id string, in TransactionRequestInput, ref ReferenceState, now time.Time) *WagerTransaction {
 	t.Helper()
-	tx, err := NewExternalTransaction(mustParse(t, ParseTransactionID, id), mustRequest(t, in), "corr-"+in.ExternalTransactionID, contractClock)
+	tx, err := NewExternalTransaction(mustParse(t, ParseTransactionID, id), mustRequest(t, in), "corr-"+in.ExternalTransactionID, now)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Settle(w, tx, ref, testPolicy, contractClock); err != nil {
+	if _, err := Settle(w, tx, ref, testPolicy, now); err != nil {
 		t.Fatal(err)
 	}
 	return tx
