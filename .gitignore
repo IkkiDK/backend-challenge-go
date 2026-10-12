@@ -1,0 +1,15 @@
+# Build output
+/bin/
+*.exe
+*.test
+
+# Test and profiling artefacts
+*.out
+coverage.*
+
+# Local environment overrides
+.env
+
+# Editors
+.idea/
+.vscode/
