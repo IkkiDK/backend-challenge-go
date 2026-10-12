@@ -165,34 +165,52 @@ func TestRefundAndRollbackCannotReturnTheSameDebitTwice(t *testing.T) {
 	rollback := newOperation(w, "ROLLBACK", "double-rollback-"+w.ID, "40.00")
 	rollback.Reference = bet.ExternalTransactionID
 
-	// The REFUND and the ROLLBACK of the same BET race; at most one may succeed.
+	// The REFUND and the ROLLBACK of the same BET race; exactly one may succeed.
 	if _, err := p.service.Submit(t.Context(), mustRequest(t, bet), httpOrigin()); err != nil {
 		t.Fatal(err)
 	}
 	var wg sync.WaitGroup
-	for _, op := range []operation{refund, rollback} {
+	for _, req := range []domain.TransactionRequest{mustRequest(t, refund), mustRequest(t, rollback)} {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if _, err := p.service.Submit(t.Context(), mustRequest(t, op), httpOrigin()); err != nil {
+			if _, err := p.service.Submit(t.Context(), req, httpOrigin()); err != nil {
 				t.Error(err)
 			}
 		}()
 	}
 	wg.Wait()
 
-	refundStatus, _ := transactionStatus(t, "provider-a", refund.ExternalTransactionID)
+	// The loser finds the winner's reversal under the wallet lock and is
+	// refused for it, rather than failing on the database's last guard.
+	refundStatus, refundCode := transactionStatus(t, "provider-a", refund.ExternalTransactionID)
 	rollbackStatus, rollbackCode := transactionStatus(t, "provider-a", rollback.ExternalTransactionID)
-	if refundStatus == "PROCESSED" && rollbackStatus == "PROCESSED" {
-		t.Fatal("the BET was returned twice")
+	processed, rejected := string(domain.StatusProcessed), string(domain.StatusRejected)
+	var loserCode string
+	switch {
+	case refundStatus == processed && rollbackStatus == rejected:
+		loserCode = rollbackCode
+	case rollbackStatus == processed && refundStatus == rejected:
+		loserCode = refundCode
+	default:
+		t.Fatalf("REFUND %s %s, ROLLBACK %s %s: want one PROCESSED and one REJECTED",
+			refundStatus, refundCode, rollbackStatus, rollbackCode)
 	}
-	if refundStatus != "PROCESSED" && rollbackStatus != "PROCESSED" {
-		t.Fatalf("neither reversal succeeded: %s / %s %s", refundStatus, rollbackStatus, rollbackCode)
+	if loserCode != string(domain.FailureReferenceAlreadyReversed) {
+		t.Fatalf("the refused reversal failed with %q, want %s", loserCode, domain.FailureReferenceAlreadyReversed)
 	}
 	requireLedgerMatchesBalance(t, w.ID, 10000)
 }
 
 func TestIndependentWalletsDoNotWaitForEachOther(t *testing.T) {
+	const (
+		// serviceApplication is the application_name postgres.NewPool sets.
+		serviceApplication = "wallet-service"
+		// independentBetLimit is far below the 5s lock timeout of the service
+		// pool, which a bet queued behind the blocked one would wait out.
+		independentBetLimit = 2 * time.Second
+		releasedBetLimit    = 10 * time.Second
+	)
 	p := newInProcess(t, testPolicy)
 	locked := openWalletInProcess(t, p, "100.00")
 	free := openWalletInProcess(t, p, "100.00")
@@ -204,33 +222,50 @@ func TestIndependentWalletsDoNotWaitForEachOther(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	if _, err := tx.Exec(ctx, `SELECT 1 FROM wallets WHERE id = $1 FOR UPDATE`, locked.ID); err != nil {
+	var holder int32
+	if err := tx.QueryRow(ctx, `SELECT pg_backend_pid() FROM wallets WHERE id = $1 FOR UPDATE`, locked.ID).Scan(&holder); err != nil {
 		t.Fatal(err)
 	}
 
-	started := time.Now()
-	if _, err := p.service.Submit(ctx, mustRequest(t, newOperation(free, "BET", "free-bet-"+free.ID, "10.00")), httpOrigin()); err != nil {
-		t.Fatal(err)
-	}
-	if elapsed := time.Since(started); elapsed > 2*time.Second {
-		t.Fatalf("a bet on another wallet waited %v: there must be no global lock", elapsed)
-	}
-
+	// A bet on that wallet enters the service and waits there for the lock.
+	lockedBet := mustRequest(t, newOperation(locked, "BET", "locked-bet-"+locked.ID, "10.00"))
 	blocked := make(chan error, 1)
 	go func() {
-		_, err := p.service.Submit(ctx, mustRequest(t, newOperation(locked, "BET", "locked-bet-"+locked.ID, "10.00")), httpOrigin())
+		_, err := p.service.Submit(ctx, lockedBet, httpOrigin())
 		blocked <- err
 	}()
+	eventually(t, 3*time.Second, "the bet on the locked wallet to wait for the row lock", func() bool {
+		return countRows(t, `SELECT count(*) FROM pg_stat_activity
+			WHERE application_name = $1 AND wait_event_type = 'Lock' AND $2 = ANY(pg_blocking_pids(pid))`,
+			serviceApplication, holder) == 1
+	})
+
+	// Whatever the waiting bet holds in the service, a bet on another wallet
+	// must not queue behind it.
+	started := time.Now()
+	result, err := p.service.Submit(ctx, mustRequest(t, newOperation(free, "BET", "free-bet-"+free.ID, "10.00")), httpOrigin())
+	if err != nil || result.Transaction.Status() != domain.StatusProcessed {
+		t.Fatalf("bet on another wallet: %+v, %v; want PROCESSED", result, err)
+	}
+	if elapsed := time.Since(started); elapsed > independentBetLimit {
+		t.Fatalf("a bet on another wallet waited %v: there must be no global lock", elapsed)
+	}
 	select {
 	case err := <-blocked:
-		t.Fatalf("a bet on the locked wallet must wait for its lock, finished with %v", err)
-	case <-time.After(500 * time.Millisecond):
+		t.Fatalf("the bet on the locked wallet finished while its row lock was held: %v", err)
+	default:
 	}
+
 	if err := tx.Rollback(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if err := <-blocked; err != nil {
-		t.Fatalf("bet after the lock was released: %v", err)
+	select {
+	case err := <-blocked:
+		if err != nil {
+			t.Fatalf("bet after the lock was released: %v", err)
+		}
+	case <-time.After(releasedBetLimit):
+		t.Fatalf("the bet on the locked wallet did not finish within %v of the lock's release", releasedBetLimit)
 	}
 	requireLedgerMatchesBalance(t, locked.ID, 9000)
 	requireLedgerMatchesBalance(t, free.ID, 9000)

@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/golang-migrate/migrate/v4"
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 
@@ -151,17 +152,61 @@ func TestDatabaseRejectsLedgerEntriesThatBreakTheChain(t *testing.T) {
 	if err := env.owner.QueryRow(t.Context(), `SELECT id FROM wagering_transactions WHERE wallet_id = $1 AND kind = 'BET'`, w.ID).Scan(&betID); err != nil {
 		t.Fatal(err)
 	}
-	// A second entry for the same transaction, then one whose balance does
-	// not follow the previous entry.
-	insert := `INSERT INTO wallet_ledger_entries VALUES (gen_random_uuid(), $1, $2, $3, 'DEBIT', 'BRL', $4, $5, $6, now())`
-	for name, args := range map[string][]any{
-		"duplicate transaction": {w.ID, betID, 3, 3000, 7000, 4000},
-		"broken chain":          {w.ID, betID, 3, 100, 9000, 8900},
-	} {
-		t.Run(name, func(t *testing.T) {
-			_, err := env.owner.Exec(t.Context(), insert, args...)
-			if state := sqlState(err); !strings.HasPrefix(state, "WL") && state != "23505" {
-				t.Fatalf("error = %v, want an invariant violation", err)
+	type entry struct {
+		transactionID         string
+		version               int64
+		direction             string
+		amount, before, after int64
+	}
+	// skipTriggers leaves only the table's own constraints to judge the entry.
+	skipTriggers := func(ctx context.Context, tx pgx.Tx, _ entry) error {
+		_, err := tx.Exec(ctx, `SET LOCAL session_replication_role = replica`)
+		return err
+	}
+	// matchWallet moves the wallet row to the entry, so the trigger's wallet
+	// check (WL004) passes and its later checks judge the entry.
+	matchWallet := func(ctx context.Context, tx pgx.Tx, e entry) error {
+		_, err := tx.Exec(ctx, `UPDATE wallets SET balance_minor = $2, version = $3 WHERE id = $1`, w.ID, e.after, e.version)
+		return err
+	}
+	// The wallet holds 70.00 at version 2: version 1 credited the 100.00
+	// opening and version 2 debited the 30.00 BET. Each entry must be refused
+	// by exactly the guard its case names.
+	cases := []struct {
+		name              string
+		prepare           func(context.Context, pgx.Tx, entry) error
+		entry             entry
+		state, constraint string
+	}{
+		{"second entry of a transaction", skipTriggers, entry{betID, 3, "DEBIT", 3000, 7000, 4000},
+			"23505", "wallet_ledger_entries_wallet_transaction_key"},
+		{"second entry of a wallet version", skipTriggers, entry{uuid.NewString(), 2, "DEBIT", 100, 7000, 6900},
+			"23505", "wallet_ledger_entries_wallet_version_key"},
+		{"BET entry that credits the wallet", matchWallet, entry{betID, 3, "CREDIT", 3000, 7000, 10000},
+			"WL006", ""},
+		{"entry that does not continue the previous balance", matchWallet, entry{betID, 3, "DEBIT", 3000, 9000, 6000},
+			"WL005", ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			ctx := t.Context()
+			tx, err := env.owner.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// Never committed: a replica session would skip the commit-time checks too.
+			defer func() { _ = tx.Rollback(ctx) }()
+			if err := c.prepare(ctx, tx, c.entry); err != nil {
+				t.Fatal(err)
+			}
+			_, err = tx.Exec(ctx, `
+				INSERT INTO wallet_ledger_entries (id, wallet_id, transaction_id, wallet_version, direction, currency,
+					amount_minor, balance_before_minor, balance_after_minor, created_at)
+				VALUES (gen_random_uuid(), $1, $2, $3, $4, 'BRL', $5, $6, $7, now())`,
+				w.ID, c.entry.transactionID, c.entry.version, c.entry.direction, c.entry.amount, c.entry.before, c.entry.after)
+			var pgErr *pgconn.PgError
+			if !errors.As(err, &pgErr) || pgErr.Code != c.state || pgErr.ConstraintName != c.constraint {
+				t.Fatalf("error = %v, want SQLSTATE %s from %q", err, c.state, c.constraint)
 			}
 		})
 	}

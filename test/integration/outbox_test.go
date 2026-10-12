@@ -7,6 +7,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -37,12 +39,14 @@ func connectedBroker(t *testing.T) *messaging.Broker {
 	return broker
 }
 
-// runRelay publishes with its own pool and broker connection, like a
-// separate instance, until the test ends.
-func runRelay(t *testing.T, owner string) {
+// runRelay publishes batches of batchSize events with its own pool and broker
+// connection, like a separate instance, until the test ends.
+func runRelay(t *testing.T, owner string, batchSize int) {
 	t.Helper()
 	p := newInProcess(t, testPolicy)
-	relay, err := outbox.NewRelay(p.store.Outbox(), connectedBroker(t), relayConfig(owner, 5*time.Second), app.SystemClock, discardLogger(), p.metrics)
+	cfg := relayConfig(owner, 5*time.Second)
+	cfg.BatchSize = batchSize
+	relay, err := outbox.NewRelay(p.store.Outbox(), connectedBroker(t), cfg, app.SystemClock, discardLogger(), p.metrics)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -81,14 +85,22 @@ func TestCompetingPublishersPublishEveryEventOnceInWalletOrder(t *testing.T) {
 		return countRows(t, `SELECT count(*) FROM outbox_events WHERE published_at IS NULL`)
 	}
 
-	runRelay(t, "relay-a")
-	runRelay(t, "relay-b")
+	// One event per claim: a relay cannot lease every wallet's next event at
+	// once, so the other relay finds work too and both publish.
+	const batchSize = 1
+	runRelay(t, "relay-a", batchSize)
+	runRelay(t, "relay-b", batchSize)
 	eventually(t, 30*time.Second, "every outbox event to be published", func() bool { return unpublished() == 0 })
 
 	for walletID := range wallets {
 		if n := countRows(t, `SELECT count(*) FROM outbox_events WHERE ordering_key = $1 AND attempts = 1`, walletID); n != eventsPerWallet {
 			t.Fatalf("wallet %s: %d events claimed exactly once, want %d", walletID, n, eventsPerWallet)
 		}
+	}
+	// Otherwise one relay did all the work and nothing competed.
+	if n := countRows(t, `SELECT count(DISTINCT claimed_by) FROM outbox_events WHERE ordering_key = ANY($1)`,
+		slices.Collect(maps.Keys(wallets))); n != 2 {
+		t.Fatalf("%d relays published the events, want both", n)
 	}
 	seen := map[string]int{}
 	versions := map[string][]int64{}
