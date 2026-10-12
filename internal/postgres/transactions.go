@@ -18,6 +18,14 @@ const transactionColumns = `id, kind, status, wallet_id, player_id, currency, am
 	reference_external_transaction_id, reference_transaction_id, failure_code, result_balance_minor,
 	attempts, next_attempt_at, correlation_id, created_at, updated_at`
 
+// transactionSelect reads transactions together with their wallet's currency,
+// the currency of every result balance: a CURRENCY_MISMATCH rejection reports
+// the wallet's balance, not an amount in the requested currency. A wallet's
+// currency never changes, and the sub-select locks no wallet row.
+const transactionSelect = `SELECT ` + transactionColumns + `,
+	(SELECT w.currency FROM wallets w WHERE w.id = wagering_transactions.wallet_id)
+	FROM wagering_transactions`
+
 type transactions struct {
 	q querier
 }
@@ -64,7 +72,7 @@ func (r transactions) Update(ctx context.Context, t *domain.WagerTransaction) er
 
 func (r transactions) ByID(ctx context.Context, id domain.TransactionID) (*domain.WagerTransaction, error) {
 	t, err := scanTransaction(r.q.QueryRow(ctx, `
-		SELECT `+transactionColumns+` FROM wagering_transactions WHERE id = $1`, id.String()))
+		`+transactionSelect+` WHERE id = $1`, id.String()))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, app.ErrTransactionNotFound
 	}
@@ -73,13 +81,13 @@ func (r transactions) ByID(ctx context.Context, id domain.TransactionID) (*domai
 
 func (r transactions) ByIdempotencyKey(ctx context.Context, provider domain.ProviderID, key domain.IdempotencyKey) (*domain.WagerTransaction, error) {
 	return optional(scanTransaction(r.q.QueryRow(ctx, `
-		SELECT `+transactionColumns+` FROM wagering_transactions
+		`+transactionSelect+`
 		WHERE provider_id = $1 AND idempotency_key = $2`, provider.String(), key.String())))
 }
 
 func (r transactions) ByExternalID(ctx context.Context, provider domain.ProviderID, id domain.ExternalTransactionID) (*domain.WagerTransaction, error) {
 	return optional(scanTransaction(r.q.QueryRow(ctx, `
-		SELECT `+transactionColumns+` FROM wagering_transactions
+		`+transactionSelect+`
 		WHERE provider_id = $1 AND external_transaction_id = $2`, provider.String(), id.String())))
 }
 
@@ -97,7 +105,7 @@ func (r transactions) IsReversed(ctx context.Context, id domain.TransactionID) (
 // foreign-key checks of transactions that reference this one.
 func (r transactions) Lock(ctx context.Context, id domain.TransactionID) (*domain.WagerTransaction, error) {
 	t, err := scanTransaction(r.q.QueryRow(ctx, `
-		SELECT `+transactionColumns+` FROM wagering_transactions WHERE id = $1 FOR NO KEY UPDATE`, id.String()))
+		`+transactionSelect+` WHERE id = $1 FOR NO KEY UPDATE`, id.String()))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, app.ErrTransactionNotFound
 	}
@@ -108,7 +116,7 @@ func (r transactions) Lock(ctx context.Context, id domain.TransactionID) (*domai
 // workers never block each other or process the same transaction twice.
 func (r transactions) ClaimDuePendingReference(ctx context.Context, now time.Time) (*domain.WagerTransaction, error) {
 	return optional(scanTransaction(r.q.QueryRow(ctx, `
-		SELECT `+transactionColumns+` FROM wagering_transactions
+		`+transactionSelect+`
 		WHERE status = 'PENDING_REFERENCE' AND next_attempt_at <= $1
 		ORDER BY next_attempt_at
 		LIMIT 1
@@ -127,19 +135,19 @@ func optional(t *domain.WagerTransaction, err error) (*domain.WagerTransaction, 
 // absence means.
 func scanTransaction(row pgx.Row) (*domain.WagerTransaction, error) {
 	var (
-		id, kind, status, walletID, playerID, currencyCode, correlationID string
-		amountMinor                                                       int64
-		providerID, externalID, idempotencyKey, payloadHash               *string
-		roundID, gameID, referenceExternalID, referenceID, failureCode    *string
-		resultBalanceMinor                                                *int64
-		attempts                                                          int
-		nextAttemptAt                                                     *time.Time
-		createdAt, updatedAt                                              time.Time
+		id, kind, status, walletID, playerID, currencyCode, walletCurrency, correlationID string
+		amountMinor                                                                       int64
+		providerID, externalID, idempotencyKey, payloadHash                               *string
+		roundID, gameID, referenceExternalID, referenceID, failureCode                    *string
+		resultBalanceMinor                                                                *int64
+		attempts                                                                          int
+		nextAttemptAt                                                                     *time.Time
+		createdAt, updatedAt                                                              time.Time
 	)
 	err := row.Scan(&id, &kind, &status, &walletID, &playerID, &currencyCode, &amountMinor,
 		&providerID, &externalID, &idempotencyKey, &payloadHash, &roundID, &gameID,
 		&referenceExternalID, &referenceID, &failureCode, &resultBalanceMinor,
-		&attempts, &nextAttemptAt, &correlationID, &createdAt, &updatedAt)
+		&attempts, &nextAttemptAt, &correlationID, &createdAt, &updatedAt, &walletCurrency)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, err
 	}
@@ -170,7 +178,7 @@ func scanTransaction(row pgx.Row) (*domain.WagerTransaction, error) {
 		s.PayloadHash = *payloadHash
 	}
 	if resultBalanceMinor != nil {
-		s.ResultBalance, err = storedMoney(*resultBalanceMinor, currencyCode)
+		s.ResultBalance, err = storedMoney(*resultBalanceMinor, walletCurrency)
 		parsing.keep(err)
 	}
 	if nextAttemptAt != nil {
