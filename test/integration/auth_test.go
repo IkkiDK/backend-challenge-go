@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 // forgeProvider rewrites the provider_id claim of a token without
@@ -145,4 +147,31 @@ func TestProvidersOnlyReachTheirOwnTransactionsAndWalletsStayInternal(t *testing
 	})
 
 	requireLedgerMatchesBalance(t, w.ID, 8000)
+}
+
+// A provider that knows a walletId but names a player who does not own it is
+// refused without learning the wallet's balance, then or on any later read.
+func TestAPlayerMismatchDoesNotRevealTheWalletBalance(t *testing.T) {
+	inst := startInstance(t, "player-mismatch", nil)
+	w := openWallet(t, inst.baseURL, "100.00")
+	token := accessToken(t, "provider-a")
+	op := newOperation(w, "LOSS", "stranger-"+w.ID, "0.00")
+	op.PlayerID = uuid.NewString()
+
+	for _, attempt := range []string{"first answer", "replay"} {
+		resp := call(t, http.MethodPost, inst.baseURL+"/wagering/transactions", token, map[string]string{"Idempotency-Key": op.key()}, op)
+		if resp.status != http.StatusUnprocessableEntity || !strings.Contains(string(resp.body), "WALLET_PLAYER_MISMATCH") {
+			t.Fatalf("%s: %d %s, want 422 WALLET_PLAYER_MISMATCH", attempt, resp.status, resp.body)
+		}
+		if strings.Contains(string(resp.body), `"balance"`) {
+			t.Fatalf("%s reveals the wallet balance: %s", attempt, resp.body)
+		}
+	}
+	read := call(t, http.MethodGet, inst.baseURL+"/providers/provider-a/wagering/transactions/"+op.ExternalTransactionID, token, nil, nil)
+	if read.status != http.StatusOK || strings.Contains(string(read.body), `"balance"`) {
+		t.Fatalf("read: %d %s, want 200 without the balance", read.status, read.body)
+	}
+	if status, failure := transactionStatus(t, "provider-a", op.ExternalTransactionID); status != "REJECTED" || failure != "WALLET_PLAYER_MISMATCH" {
+		t.Fatalf("stored outcome %s %s, want the audited rejection", status, failure)
+	}
 }

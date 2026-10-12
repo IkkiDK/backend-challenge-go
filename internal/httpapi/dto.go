@@ -137,10 +137,20 @@ func newSubmitResponse(result app.SubmitResult) submitResponse {
 	if t.FailureCode() != "" {
 		response.FailureClass = t.FailureCode().Class()
 	}
-	if balance := t.ResultBalance(); balance.IsValid() {
-		response.Balance = &balance
-	}
+	response.Balance = visibleBalance(t)
 	return response
+}
+
+// visibleBalance is the result balance a response may show. A
+// WALLET_PLAYER_MISMATCH rejection stores the wallet's balance for audit, but
+// its caller named a player who does not own the wallet, so no response
+// reveals that balance.
+func visibleBalance(t *domain.WagerTransaction) *money.Money {
+	balance := t.ResultBalance()
+	if !balance.IsValid() || t.FailureCode() == domain.FailureWalletPlayerMismatch {
+		return nil
+	}
+	return &balance
 }
 
 // transactionResponse is the full view of a transaction. Provider fields are
@@ -199,9 +209,7 @@ func newTransactionResponse(t *domain.WagerTransaction) transactionResponse {
 	if s.FailureCode != "" {
 		response.FailureClass = s.FailureCode.Class()
 	}
-	if s.ResultBalance.IsValid() {
-		response.Balance = &s.ResultBalance
-	}
+	response.Balance = visibleBalance(t)
 	if !s.NextAttemptAt.IsZero() {
 		response.NextAttemptAt = &s.NextAttemptAt
 	}
