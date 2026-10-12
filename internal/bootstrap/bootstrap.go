@@ -202,7 +202,7 @@ func newHTTPServer(cfg config.Config, service *app.Service, verifier *auth.Verif
 		Metrics:        metrics,
 		RequestTimeout: cfg.HTTP.RequestTimeout,
 	})
-	return httpapi.NewServer(cfg.HTTP.Addr, handler, cfg.HTTP.ReadHeaderTimeout, readiness, logger)
+	return httpapi.NewServer(cfg.HTTP.Addr, handler, cfg.HTTP.Timeouts, readiness, logger)
 }
 
 // awaitDependency retries probe until it succeeds or the start timeout

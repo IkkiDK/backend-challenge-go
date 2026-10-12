@@ -59,3 +59,25 @@ func TestLoadReportsEveryProblem(t *testing.T) {
 		}
 	}
 }
+
+func TestLoadRequiresHTTPTimeoutsThatLeaveRoomToAnswer(t *testing.T) {
+	cases := map[string]map[string]string{
+		"write timeout below the request timeout": {"HTTP_WRITE_TIMEOUT": "5s"},
+		"read timeout below the header timeout":   {"HTTP_READ_TIMEOUT": "1s"},
+		"no idle timeout":                         {"HTTP_IDLE_TIMEOUT": "0s"},
+	}
+	for name, overrides := range cases {
+		t.Run(name, func(t *testing.T) {
+			values := map[string]string{}
+			for k, v := range requiredEnv {
+				values[k] = v
+			}
+			for k, v := range overrides {
+				values[k] = v
+			}
+			if _, err := Load(env(values)); err == nil || !strings.Contains(err.Error(), "HTTP_WRITE_TIMEOUT must exceed") {
+				t.Fatalf("error = %v, want the HTTP timeout rule", err)
+			}
+		})
+	}
+}

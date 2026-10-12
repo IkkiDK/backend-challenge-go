@@ -12,6 +12,7 @@ import (
 
 	"github.com/IkkiDK/backend-challenge-go/internal/auth"
 	"github.com/IkkiDK/backend-challenge-go/internal/domain"
+	"github.com/IkkiDK/backend-challenge-go/internal/httpapi"
 	"github.com/IkkiDK/backend-challenge-go/internal/outbox"
 	"github.com/IkkiDK/backend-challenge-go/internal/postgres"
 )
@@ -37,9 +38,9 @@ type Config struct {
 
 // HTTP configures the API server.
 type HTTP struct {
-	Addr              string
-	RequestTimeout    time.Duration
-	ReadHeaderTimeout time.Duration
+	Addr           string
+	RequestTimeout time.Duration
+	Timeouts       httpapi.Timeouts
 }
 
 // SQS locates the broker and the queues. Credentials come from the standard
@@ -98,9 +99,14 @@ func Load(getenv func(string) string) (Config, error) {
 		StartTimeout:    l.duration("START_TIMEOUT", 60*time.Second),
 		ShutdownTimeout: l.duration("SHUTDOWN_TIMEOUT", 25*time.Second),
 		HTTP: HTTP{
-			Addr:              l.string("HTTP_ADDR", ":8080"),
-			RequestTimeout:    l.duration("HTTP_REQUEST_TIMEOUT", 10*time.Second),
-			ReadHeaderTimeout: l.duration("HTTP_READ_HEADER_TIMEOUT", 5*time.Second),
+			Addr:           l.string("HTTP_ADDR", ":8080"),
+			RequestTimeout: l.duration("HTTP_REQUEST_TIMEOUT", 10*time.Second),
+			Timeouts: httpapi.Timeouts{
+				ReadHeader: l.duration("HTTP_READ_HEADER_TIMEOUT", 5*time.Second),
+				Read:       l.duration("HTTP_READ_TIMEOUT", 15*time.Second),
+				Write:      l.duration("HTTP_WRITE_TIMEOUT", 20*time.Second),
+				Idle:       l.duration("HTTP_IDLE_TIMEOUT", 60*time.Second),
+			},
 		},
 		Database: postgres.Config{
 			URL:                      l.required("DATABASE_URL"),
@@ -162,6 +168,10 @@ func Load(getenv func(string) string) (Config, error) {
 		"CONSUMER_RETRY_BASE_DELAY must be positive and not above CONSUMER_RETRY_MAX_DELAY")
 	l.check(cfg.HTTP.RequestTimeout > 0 && cfg.ShutdownTimeout > 0 && cfg.StartTimeout > 0,
 		"HTTP_REQUEST_TIMEOUT, START_TIMEOUT and SHUTDOWN_TIMEOUT must be positive")
+	// A request that times out still needs time to have its answer written.
+	l.check(cfg.HTTP.Timeouts.ReadHeader > 0 && cfg.HTTP.Timeouts.Read >= cfg.HTTP.Timeouts.ReadHeader &&
+		cfg.HTTP.Timeouts.Write > cfg.HTTP.RequestTimeout && cfg.HTTP.Timeouts.Idle > 0,
+		"HTTP_READ_TIMEOUT must cover HTTP_READ_HEADER_TIMEOUT, HTTP_WRITE_TIMEOUT must exceed HTTP_REQUEST_TIMEOUT and HTTP_IDLE_TIMEOUT must be positive")
 	l.check(cfg.Outbox.PollInterval > 0 && cfg.References.PollInterval > 0,
 		"OUTBOX_POLL_INTERVAL and REFERENCE_POLL_INTERVAL must be positive")
 	l.keep(cfg.Outbox.Relay.Validate())
