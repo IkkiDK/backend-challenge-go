@@ -1,7 +1,7 @@
 // Package bootstrap is the composition root: it wires configuration,
 // connections, repositories, use cases, handlers and workers with Uber Fx.
-// It is the only package that knows Fx; every component it composes exposes
-// plain constructors and Start/Stop methods.
+// Only it and cmd/wallet, which runs the application, know Fx; every
+// component it composes exposes plain constructors and Start/Stop methods.
 //
 // Fx starts lifecycle hooks in registration order and stops them in reverse.
 // Dependencies register their hooks first (startup verifies them before
@@ -59,10 +59,20 @@ func Options(cfg config.Config) fx.Option {
 		authModule,
 		applicationModule,
 		messagingModule,
+		dependencyChecks,
 		workersModule(cfg),
 		httpModule,
 	)
 }
+
+// dependencyChecks builds every dependency before the workers. Fx runs a
+// constructor, which registers its start hook, only when something first
+// needs it, and runs a module's invocations before those of the modules
+// declared after it; requiring the dependencies here makes startup verify
+// PostgreSQL, the identity provider and SQS before any work begins.
+var dependencyChecks = fx.Module("dependencies",
+	fx.Invoke(func(*postgres.Store, *auth.Verifier, *messaging.Broker) {}),
+)
 
 var observabilityModule = fx.Module("observability",
 	fx.Provide(
